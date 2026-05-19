@@ -3,93 +3,111 @@ PSF quality evaluation: rotation angle extraction and linearity analysis.
 
 For a DH-PSF, the two lobes rotate as a function of defocus z.
 A good design shows a linear relationship between rotation angle and z.
+
+Primary method: direct peak-finding (robust, fast).
+Fallback: double-Gaussian fitting (slower, less reliable).
 """
 
 from __future__ import annotations
 
 import numpy as np
-from scipy.optimize import minimize
-from scipy.ndimage import center_of_mass
+from scipy.ndimage import maximum_filter
 
 
-def _double_gaussian_model(params, x, y):
-    """Two symmetric Gaussian lobes model.
+def extract_lobe_angle(psf: np.ndarray) -> dict:
+    """Extract DH-PSF rotation angle by finding the two brightest off-centre peaks.
 
-    params: (x0, y0, sigma, amplitude)
-    Lobes at (+x0, +y0) and (-x0, -y0).
-    """
-    x0, y0, sigma, amp = params
-    g1 = amp * np.exp(-((x - x0) ** 2 + (y - y0) ** 2) / (2 * sigma ** 2))
-    g2 = amp * np.exp(-((x + x0) ** 2 + (y + y0) ** 2) / (2 * sigma ** 2))
-    return g1 + g2
-
-
-def fit_double_gaussian(psf: np.ndarray) -> dict:
-    """Fit a double-Gaussian model to extract lobe positions.
+    More robust than parametric fitting — directly locates the two lobes
+    via local maximum detection and computes the angle of the line
+    connecting them.
 
     Parameters
     ----------
-    psf : (H, W) float array — single PSF image, normalised
+    psf : (H, W) float array - single PSF image, normalised to [0, 1]
 
     Returns
     -------
-    dict: x0, y0, sigma, amplitude, theta_deg (rotation angle), residual
+    dict with keys:
+        theta_deg : float - rotation angle in [0, 180) degrees
+        success : bool - whether two valid lobes were found
+        separation : float - distance between the two lobes (pixels)
+        p1, p2 : tuple - (x, y) positions of the two lobes relative to centre
     """
     H, W = psf.shape
-    cy, cx = H / 2, W / 2
+    cy, cx = H / 2.0, W / 2.0
 
-    # Create coordinate grids centred at image centre
-    y_grid, x_grid = np.mgrid[0:H, 0:W]
-    x_grid = x_grid.astype(float) - cx
-    y_grid = y_grid.astype(float) - cy
+    threshold = psf.max() * 0.25
+    if threshold < 1e-10:
+        return {"theta_deg": 0.0, "success": False, "separation": 0.0,
+                "p1": (0.0, 0.0), "p2": (0.0, 0.0)}
 
-    # Initial guess from centre of mass of top-half and bottom-half
-    # Use intensity-weighted approach
-    threshold = psf.max() * 0.3
-    mask = psf > threshold
-    if mask.sum() < 5:
-        # Very weak signal
-        return {
-            "x0": 0, "y0": 0, "sigma": 5, "amplitude": 0,
-            "theta_deg": 0, "residual": float("inf"),
-        }
+    # Find local maxima above threshold
+    local_max = (maximum_filter(psf, size=11) == psf) & (psf > threshold)
+    peak_ys, peak_xs = np.where(local_max)
 
-    # Find two peaks by splitting the masked region
-    coords = np.column_stack(np.where(mask))
-    com = center_of_mass(psf * mask)
-    cy_com, cx_com = com
+    if len(peak_ys) < 2:
+        return {"theta_deg": 0.0, "success": False, "separation": 0.0,
+                "p1": (0.0, 0.0), "p2": (0.0, 0.0)}
 
-    # Initial guess: offset from centre
-    weighted_x = np.sum(x_grid * psf * mask) / np.sum(psf * mask)
-    x0_init = max(abs(weighted_x), 3.0)
-    y0_init = 0.0
-    sigma_init = 3.0
-    amp_init = psf.max()
+    # Distance from centre for each peak
+    dists = np.sqrt((peak_xs - cx) ** 2 + (peak_ys - cy) ** 2)
+    intensities = psf[peak_ys, peak_xs]
 
-    def cost(params):
-        model = _double_gaussian_model(params, x_grid, y_grid)
-        return np.sum((psf - model) ** 2)
+    # Prefer off-centre peaks (the DH lobes are away from centre)
+    off_center = dists > 5
+    if off_center.sum() >= 2:
+        oc_idx = np.where(off_center)[0]
+        oc_int = intensities[oc_idx]
+        top2 = oc_idx[np.argsort(-oc_int)[:2]]
+    elif off_center.sum() == 1 and len(peak_ys) >= 2:
+        # One off-centre peak + pick the second-brightest overall
+        oc_idx = np.where(off_center)[0][0]
+        all_sorted = np.argsort(-intensities)
+        second = all_sorted[0] if all_sorted[0] != oc_idx else all_sorted[1]
+        top2 = np.array([oc_idx, second])
+    else:
+        # All peaks near centre — take brightest two anyway
+        top2 = np.argsort(-intensities)[:2]
 
-    try:
-        result = minimize(
-            cost, [x0_init, y0_init, sigma_init, amp_init],
-            method="Nelder-Mead",
-            options={"maxiter": 2000, "xatol": 0.1, "fatol": 1e-6},
-        )
-        x0, y0, sigma, amp = result.x
-        theta = np.rad2deg(np.arctan2(y0, x0))
-        return {
-            "x0": float(x0), "y0": float(y0),
-            "sigma": float(abs(sigma)),
-            "amplitude": float(abs(amp)),
-            "theta_deg": float(theta),
-            "residual": float(result.fun),
-        }
-    except Exception:
-        return {
-            "x0": 0, "y0": 0, "sigma": 5, "amplitude": 0,
-            "theta_deg": 0, "residual": float("inf"),
-        }
+    p1x = float(peak_xs[top2[0]] - cx)
+    p1y = float(peak_ys[top2[0]] - cy)
+    p2x = float(peak_xs[top2[1]] - cx)
+    p2y = float(peak_ys[top2[1]] - cy)
+
+    # Subpixel refinement: intensity-weighted centroid in 5x5 region
+    for idx, (px, py) in enumerate([(peak_xs[top2[0]], peak_ys[top2[0]]),
+                                     (peak_xs[top2[1]], peak_ys[top2[1]])]):
+        y_lo = max(0, py - 2)
+        y_hi = min(H, py + 3)
+        x_lo = max(0, px - 2)
+        x_hi = min(W, px + 3)
+        roi = psf[y_lo:y_hi, x_lo:x_hi]
+        if roi.sum() > 0:
+            ry, rx = np.indices(roi.shape)
+            refined_y = float(np.average(ry, weights=roi)) + y_lo - cy
+            refined_x = float(np.average(rx, weights=roi)) + x_lo - cx
+            if idx == 0:
+                p1x, p1y = refined_x, refined_y
+            else:
+                p2x, p2y = refined_x, refined_y
+
+    # Angle of line from lobe2 to lobe1
+    dx = p1x - p2x
+    dy = p1y - p2y
+    theta = np.rad2deg(np.arctan2(dy, dx))
+
+    # Normalise to [0, 180) to remove lobe-labeling ambiguity
+    theta = theta % 180.0
+
+    separation = np.sqrt(dx ** 2 + dy ** 2)
+
+    return {
+        "theta_deg": float(theta),
+        "success": True,
+        "separation": float(separation),
+        "p1": (p1x, p1y),
+        "p2": (p2x, p2y),
+    }
 
 
 def evaluate_psf_stack(
@@ -99,30 +117,39 @@ def evaluate_psf_stack(
 ) -> dict:
     """Evaluate a full PSF z-stack for DH-PSF quality.
 
+    Extracts rotation angle at each z position using peak-finding,
+    then measures the linearity of the theta-vs-z relationship.
+
     Parameters
     ----------
     psfs : (N_z, H, W) float array
-    z_positions : list of propagation distances (μm)
-    focal_length : focal length (μm)
+    z_positions : list of propagation distances (um)
+    focal_length : focal length (um)
 
     Returns
     -------
     dict with keys:
-        thetas : list of rotation angles (degrees)
-        z_offsets : list of z offsets from focus (μm)
-        r_squared : float — linearity of theta vs z
-        theta_range : float — total rotation range (degrees)
-        main_lobe_ratio : float — average ratio of peak to background
+        thetas : list of rotation angles (degrees, unwrapped)
+        z_offsets : list of z offsets from focus (um)
+        r_squared : float - linearity of theta vs z (higher = better DH-PSF)
+        theta_range : float - total rotation range (degrees)
+        main_lobe_ratio : float - average ratio of peak to background
+        mean_separation : float - average distance between lobes (pixels)
     """
     z_offsets = [z - focal_length for z in z_positions]
     thetas = []
     lobe_ratios = []
+    separations = []
+    n_success = 0
 
-    for i, psf in enumerate(psfs):
-        fit = fit_double_gaussian(psf)
-        thetas.append(fit["theta_deg"])
+    for psf in psfs:
+        result = extract_lobe_angle(psf)
+        thetas.append(result["theta_deg"])
+        separations.append(result["separation"])
+        if result["success"]:
+            n_success += 1
 
-        # Main lobe energy ratio
+        # Main lobe energy ratio (peak to median background)
         peak = psf.max()
         mean_bg = np.percentile(psf, 50)
         ratio = peak / max(mean_bg, 1e-8)
@@ -131,7 +158,8 @@ def evaluate_psf_stack(
     thetas = np.array(thetas)
     z_arr = np.array(z_offsets)
 
-    # Unwrap potential ±180° jumps
+    # Unwrap: angles are in [0, 180), detect jumps near the boundary
+    # A jump > 90 degrees between consecutive frames indicates wrapping
     for i in range(1, len(thetas)):
         diff = thetas[i] - thetas[i - 1]
         if diff > 90:
@@ -140,7 +168,7 @@ def evaluate_psf_stack(
             thetas[i:] += 180
 
     # Linear fit: theta = a * z + b
-    if len(z_arr) > 2 and np.std(z_arr) > 0:
+    if len(z_arr) > 2 and np.std(z_arr) > 0 and n_success >= 3:
         coeffs = np.polyfit(z_arr, thetas, 1)
         theta_fit = np.polyval(coeffs, z_arr)
         ss_res = np.sum((thetas - theta_fit) ** 2)
@@ -155,4 +183,5 @@ def evaluate_psf_stack(
         "r_squared": r2,
         "theta_range": float(thetas.max() - thetas.min()),
         "main_lobe_ratio": float(np.mean(lobe_ratios)),
+        "mean_separation": float(np.mean(separations)),
     }

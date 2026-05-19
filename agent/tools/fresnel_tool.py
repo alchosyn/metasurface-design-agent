@@ -50,21 +50,29 @@ def make_fresnel_tool():
         r2 = quality["r_squared"]
         theta_range = quality["theta_range"]
         lobe_ratio = quality["main_lobe_ratio"]
+        pb_eff = prop_result.get("pb_efficiency", 1.0)
 
         if r2 > 0.95:
             verdict = "Excellent DH-PSF quality"
         elif r2 > 0.85:
             verdict = "Good DH-PSF quality"
         elif r2 > 0.70:
-            verdict = "Moderate DH-PSF quality — consider optimising further"
+            verdict = "Moderate DH-PSF quality - consider optimising further"
         else:
-            verdict = "Poor DH-PSF quality — design needs improvement"
+            verdict = "Poor DH-PSF quality - design needs improvement"
+
+        # Phase error and overall efficiency
+        phase_err = abs(abs(dphi_deg) - 180.0)
+        signal_eff = pb_eff * T_avg_pct / 100.0
 
         return (
             f"PSF evaluation (dphi={dphi_deg:.1f} deg, T_avg={T_avg_pct:.1f}%):\n"
             f"  Rotation linearity R-squared: {r2:.4f}\n"
             f"  Rotation angle range: {theta_range:.1f} deg\n"
             f"  Main lobe contrast ratio: {lobe_ratio:.1f}\n"
+            f"  PB efficiency: {pb_eff:.4f} (sin^2(dphi/2))\n"
+            f"  Signal efficiency: {signal_eff:.4f} (PB_eff x T_avg)\n"
+            f"  Phase error: {phase_err:.1f} deg\n"
             f"  Verdict: {verdict}\n"
             f"  (Propagated through {len(prop_result['z_positions'])} "
             f"z-positions, f={prop_result['focal_length']:.0f} um)"

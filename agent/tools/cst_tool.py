@@ -65,6 +65,15 @@ def make_cst_tool(shared: SharedState):
                 f"or declare convergence."
             )
 
+        # ── Enforce surrogate training ──
+        if shared.cst_call_count >= 20 and not shared.surrogate_trained:
+            return (
+                f"BLOCKED: You have used {shared.cst_call_count} CST calls "
+                f"without training the surrogate model. You MUST call "
+                f"train_surrogate NOW before running any more CST simulations. "
+                f"You have enough data ({len(shared.cst_database)} points)."
+            )
+
         # ── Check duplicates ──
         for r in shared.cst_database:
             if (abs(r["L"] - L) < 0.5 and abs(r["W"] - W) < 0.5
