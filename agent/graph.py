@@ -43,8 +43,9 @@ from agent.prompts import SYSTEM_PROMPT
 from agent.state import OptimizationState
 from agent.tools import SharedState, build_tools
 from agent.nodes import (
+    CompressionStrategy,
     make_agent_node, make_sync_node, make_compress_node, inject_hint,
-    should_continue, post_tool_router,
+    should_continue, make_post_tool_router,
 )
 
 
@@ -52,6 +53,9 @@ def build_agent(
     shared: SharedState | None = None,
     max_cst_calls: int = MAX_CST_CALLS,
     api_key: str | None = None,
+    compression: CompressionStrategy = CompressionStrategy.DUAL,
+    compress_trigger_tokens: int | None = None,
+    compress_target_tokens: int | None = None,
 ):
     """Build the custom StateGraph agent.
 
@@ -101,7 +105,11 @@ def build_agent(
     graph.add_node("agent", make_agent_node(llm, tools, system_prompt_template))
     graph.add_node("tools", ToolNode(tools))
     graph.add_node("sync_state", make_sync_node(shared))
-    graph.add_node("compress", make_compress_node(shared, llm))  # needs LLM for Track 2
+    graph.add_node("compress", make_compress_node(
+        shared, llm, compression,
+        trigger_tokens=compress_trigger_tokens,
+        target_tokens=compress_target_tokens,
+    ))
     graph.add_node("inject_hint", inject_hint)
 
     # — Edges —
@@ -117,6 +125,7 @@ def build_agent(
     graph.add_edge("tools", "sync_state")
 
     # After sync: route based on state conditions
+    post_tool_router = make_post_tool_router(compress_trigger_tokens)
     graph.add_conditional_edges("sync_state", post_tool_router, {
         "agent": "agent",
         "compress": "compress",

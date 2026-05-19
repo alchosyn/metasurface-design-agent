@@ -42,6 +42,11 @@ class SharedState:
     surrogate_trained: bool = False
     surrogate_r2: Optional[dict] = None
 
+    # ── Surrogate training history (for evaluation) ──
+    # Each entry: {"n_points": int, "r2_dphi": float, "r2_T_TE": float,
+    #              "r2_T_TM": float, "cst_call_count": int}
+    surrogate_train_history: list[dict] = field(default_factory=list)
+
 
 def build_tools(shared: SharedState) -> list:
     """Construct all tools with access to the shared state."""

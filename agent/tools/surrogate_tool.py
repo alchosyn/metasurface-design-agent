@@ -57,8 +57,19 @@ def make_train_tool(shared: SharedState):
         shared.surrogate_trained = True
         shared.surrogate_r2 = r2
 
+        # Record training event for evaluation
+        shared.surrogate_train_history.append({
+            "n_points": n,
+            "r2_dphi": float(r2["dphi"]),
+            "r2_T_TE": float(r2["T_TE"]),
+            "r2_T_TM": float(r2["T_TM"]),
+            "cst_call_count": shared.cst_call_count,
+        })
+
+        retrain_idx = len(shared.surrogate_train_history)
         return (
-            f"Surrogate trained on {n} CST data points. "
+            f"Surrogate trained on {n} CST data points "
+            f"(training #{retrain_idx}). "
             f"Validation R-squared: "
             f"dphi={r2['dphi']:.3f}, "
             f"T_TE={r2['T_TE']:.3f}, "

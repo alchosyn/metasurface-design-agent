@@ -1,3 +1,31 @@
 __pycache__/
 *.pyc
 .idea/
+
+# ── MATLAB (physics-only code, archived separately) ──
+matlab/
+*.m
+
+# ── ML baseline (pre-trained models, not part of agent) ──
+ml/
+
+# ── Data artifacts ──
+data/
+*.csv
+*.npz
+*.pth
+*.mat
+
+# ── Agent run outputs ──
+data/agent_runs/
+
+# ── Claude Code session state ──
+.claude/
+
+# ── Environment / secrets ──
+.env
+*.env
+
+# ── OS junk ──
+Thumbs.db
+.DS_Store

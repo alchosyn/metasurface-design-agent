@@ -93,15 +93,17 @@ def make_cst_tool(shared: SharedState):
             result = _real_simulate(L, W, h, shared)
 
         # ── Compute FOM ──
-        phase_err = abs(abs(result["dphi_deg"]) - 180.0)
-        T_avg = (result["T_TE_pct"] + result["T_TM_pct"]) / 2.0
-        fom = (-FOM_PHASE_WEIGHT * phase_err + FOM_TRANS_WEIGHT * T_avg / 100.0)
+        # Cast everything to native float — numpy.float64 poisons the
+        # SharedState dicts which MemorySaver cannot serialise (msgpack).
+        phase_err = float(abs(abs(result["dphi_deg"]) - 180.0))
+        T_avg = float((result["T_TE_pct"] + result["T_TM_pct"]) / 2.0)
+        fom = float(-FOM_PHASE_WEIGHT * phase_err + FOM_TRANS_WEIGHT * T_avg / 100.0)
 
         record = {
-            "L": L, "W": W, "h": h,
-            "dphi_deg": result["dphi_deg"],
-            "T_TE_pct": result["T_TE_pct"],
-            "T_TM_pct": result["T_TM_pct"],
+            "L": float(L), "W": float(W), "h": float(h),
+            "dphi_deg": float(result["dphi_deg"]),
+            "T_TE_pct": float(result["T_TE_pct"]),
+            "T_TM_pct": float(result["T_TM_pct"]),
             "T_avg_pct": T_avg,
             "phase_err_deg": phase_err,
             "fom": fom,
@@ -169,9 +171,10 @@ def _mock_simulate(L: float, W: float, h: float, shared: SharedState) -> dict:
         T_TE = 95.0 - 0.01 * (L - 200) ** 2 / 100
         T_TM = 90.0 - 0.02 * (W - 100) ** 2 / 100
 
-    # Add noise
-    dphi += np.random.normal(0, 1.5)
-    T_TE = np.clip(T_TE + np.random.normal(0, 0.8), 0, 100)
-    T_TM = np.clip(T_TM + np.random.normal(0, 0.8), 0, 100)
+    # Add noise — cast to native float to prevent numpy.float64 leaking
+    # into SharedState (MemorySaver checkpointer can't serialise numpy).
+    dphi = float(dphi + np.random.normal(0, 1.5))
+    T_TE = float(np.clip(T_TE + np.random.normal(0, 0.8), 0, 100))
+    T_TM = float(np.clip(T_TM + np.random.normal(0, 0.8), 0, 100))
 
     return {"dphi_deg": dphi, "T_TE_pct": T_TE, "T_TM_pct": T_TM}

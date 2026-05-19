@@ -45,9 +45,32 @@ Context compression design (the interesting part):
 from __future__ import annotations
 
 import logging
+from enum import Enum
 from typing import TYPE_CHECKING, Literal
 
-from langchain_core.messages import AIMessage, SystemMessage, RemoveMessage
+from langchain_core.messages import (
+    AIMessage, HumanMessage, SystemMessage, ToolMessage, RemoveMessage,
+)
+
+
+class CompressionStrategy(str, Enum):
+    """Selectable compression strategies for ablation experiments.
+
+    NONE:       No compression — context grows unbounded until the LLM's
+                window is exhausted.  Baseline for measuring information
+                loss from compression.
+    TRUNCATE:   Keep head + adaptive tail, discard middle without any
+                summary.  Cheapest but loses ALL historical context.
+    STRUCTURED: Track 1 only — deterministic experiment-state summary
+                from SharedState.  Preserves facts, loses reasoning.
+    DUAL:       Track 1 + Track 2 — adds one focused LLM call to extract
+                strategic reasoning from the removed messages.  Preserves
+                both facts and implicit reasoning at the cost of ~1 API call.
+    """
+    NONE = "none"
+    TRUNCATE = "truncate"
+    STRUCTURED = "structured"
+    DUAL = "dual"
 
 if TYPE_CHECKING:
     from agent.tools import SharedState
@@ -149,88 +172,119 @@ def make_sync_node(shared: "SharedState"):
         if shared.best_result is not None:
             best_fom = shared.best_result.get("fom", -999.0)
 
+        # Cast to native Python types — MemorySaver uses msgpack which
+        # cannot serialise numpy.float64 / numpy.int64.
         return {
-            "cst_call_count": shared.cst_call_count,
-            "surrogate_trained": shared.surrogate_trained,
-            "surrogate_r2_dphi": r2,
-            "best_fom": best_fom,
+            "cst_call_count": int(shared.cst_call_count),
+            "surrogate_trained": bool(shared.surrogate_trained),
+            "surrogate_r2_dphi": float(r2),
+            "best_fom": float(best_fom),
         }
 
     return sync_state
 
 
-# ── Node: compress (dual-track) ──────────────────────────────────────
+# ── Node: compress ────────────────────────────────────────────────────
 
-def make_compress_node(shared: "SharedState", llm):
-    """Create the dual-track context-compression node.
+def make_compress_node(
+    shared: "SharedState",
+    llm,
+    strategy: CompressionStrategy = CompressionStrategy.DUAL,
+    trigger_tokens: int | None = None,
+    target_tokens: int | None = None,
+):
+    """Create a configurable context-compression node.
 
-    Two independent tracks produce the replacement summary:
+    The ``strategy`` parameter selects what replaces the compressed
+    messages — see ``CompressionStrategy`` for the four options.
 
-    **Track 1 — Deterministic (structured facts)**
-      Built from SharedState: database stats, top-5 results, surrogate
-      accuracy, best candidate.  Zero LLM cost, perfectly faithful.
+    Regardless of strategy, the tail window is always **token-budget-
+    aware**: it keeps as many recent messages as fit within the target,
+    with a floor of ``COMPRESS_MIN_TAIL``.
 
-    **Track 2 — Semantic (reasoning memory)**
-      One focused LLM call extracts parameter insights, promising regions,
-      abandoned strategies, and current plan from the messages about to be
-      removed.  This preserves the *reasoning* that only exists in text.
-
-    The tail window is token-budget-aware: it walks backward from the most
-    recent message, accumulating characters until hitting the target budget,
-    then keeps at least ``COMPRESS_MIN_TAIL`` messages.
-
-    Falls back to deterministic-only if the LLM extraction call fails.
+    Parameters
+    ----------
+    shared : SharedState
+        For Track 1 deterministic summary.
+    llm : BaseChatModel
+        For Track 2 reasoning extraction (only used by DUAL strategy).
+    strategy : CompressionStrategy
+        Which replacement summary to generate.
+    trigger_tokens : int, optional
+        Override ``COMPRESS_TRIGGER_TOKENS`` (useful for evaluation).
+    target_tokens : int, optional
+        Override ``COMPRESS_TARGET_TOKENS``.
     """
+    _trigger = trigger_tokens or COMPRESS_TRIGGER_TOKENS
+    _target = target_tokens or COMPRESS_TARGET_TOKENS
 
     def compress(state):
         messages = state["messages"]
         est_tokens = _estimate_tokens(messages)
 
-        if est_tokens < COMPRESS_TRIGGER_TOKENS:  # router already checked, but safety
-            return {}  # safety no-op
+        if strategy == CompressionStrategy.NONE:
+            return {}
+
+        if est_tokens < _trigger:
+            return {}
 
         # ── Adaptive tail: keep as many recent msgs as fit the budget ──
-        keep_tail = _compute_adaptive_tail(messages)
+        keep_tail = _compute_adaptive_tail(messages, _target)
 
         if keep_tail >= len(messages) - COMPRESS_KEEP_HEAD:
-            return {}  # nothing to compress
+            return {}
 
-        to_compress = (
-            messages[COMPRESS_KEEP_HEAD:-keep_tail]
-            if keep_tail > 0
-            else messages[COMPRESS_KEEP_HEAD:]
-        )
+        # ── Align to safe boundary (don't break tool-call cycles) ──
+        proposed_split = len(messages) - keep_tail
+        safe_split = _align_to_safe_boundary(messages, proposed_split)
+
+        to_compress = messages[COMPRESS_KEEP_HEAD:safe_split]
         if not to_compress:
             return {}
 
-        # ── Track 1: deterministic structured summary ──
-        structured = _build_structured_summary(shared)
+        # ── Build replacement summary based on strategy ──
+        if strategy == CompressionStrategy.TRUNCATE:
+            combined = (
+                f"[Context compressed: {len(to_compress)} messages removed. "
+                f"No summary available — rely on recent messages only.]"
+            )
+        elif strategy == CompressionStrategy.STRUCTURED:
+            combined = _build_structured_summary(shared)
+        elif strategy == CompressionStrategy.DUAL:
+            structured = _build_structured_summary(shared)
+            semantic = _extract_reasoning_memory(llm, to_compress)
+            combined = f"{structured}\n\n{semantic}"
+        else:
+            combined = ""
 
-        # ── Track 2: LLM-based reasoning memory extraction ──
-        semantic = _extract_reasoning_memory(llm, to_compress)
-
-        combined = f"{structured}\n\n{semantic}"
-
-        # Remove compressed messages, inject combined summary
-        removals = [
-            RemoveMessage(id=m.id)
-            for m in to_compress
-            if getattr(m, "id", None)
-        ]
+        # ── Reconstruct entire message list (safest approach) ──
+        # Instead of surgical RemoveMessage (which can leave orphaned
+        # tool_calls), we remove ALL messages and rebuild a validated
+        # sequence: head + summary + sanitised tail.
+        head = list(messages[:COMPRESS_KEEP_HEAD])
+        tail = list(messages[safe_split:])
         summary_msg = SystemMessage(content=combined)
 
-        new_est = _estimate_tokens(
-            list(messages[:COMPRESS_KEEP_HEAD])
-            + [summary_msg]
-            + list(messages[-keep_tail:] if keep_tail > 0 else [])
-        )
+        # Sanitize the ENTIRE reconstructed list — not just the tail.
+        # The head can also contain an AIMessage with tool_calls whose
+        # ToolMessages were in the compressed middle section.
+        new_msgs = _sanitize_tool_sequences(head + [summary_msg] + tail)
+
+        remove_all = [
+            RemoveMessage(id=m.id)
+            for m in messages
+            if getattr(m, "id", None)
+        ]
+
+        new_est = _estimate_tokens(new_msgs)
         logger.info(
-            f"Context compression: ~{est_tokens} -> ~{new_est} est. tokens, "
-            f"removed {len(removals)} messages, "
-            f"kept head={COMPRESS_KEEP_HEAD} tail={keep_tail}"
+            f"Compression [{strategy.value}]: "
+            f"~{est_tokens} -> ~{new_est} est. tokens, "
+            f"removed {len(to_compress)} messages from middle, "
+            f"kept head={COMPRESS_KEEP_HEAD} tail={len(tail)}"
         )
 
-        return {"messages": removals + [summary_msg]}
+        return {"messages": remove_all + new_msgs}
 
     return compress
 
@@ -273,33 +327,39 @@ def should_continue(state) -> Literal["tools", "end"]:
 
 # ── Routing: post_tool_router ─────────────────────────────────────────
 
-def post_tool_router(state) -> Literal["agent", "compress", "inject_hint"]:
-    """Route after sync_state based on token budget and workflow state.
+def make_post_tool_router(
+    trigger_tokens: int | None = None,
+):
+    """Create the post-tool routing function.
 
-    Evaluated purely from ``OptimizationState`` fields (+ messages for
-    token estimation).  Priority order:
-
-      1. **compress** — token budget exceeded.
-      2. **inject_hint** — approaching CST limit without surrogate.
-      3. **agent** — default.
+    Wraps the trigger threshold so evaluation code can lower it.
     """
-    messages = state.get("messages", [])
-    est_tokens = _estimate_tokens(messages)
-    cst_count = state.get("cst_call_count", 0)
-    trained = state.get("surrogate_trained", False)
+    _trigger = trigger_tokens or COMPRESS_TRIGGER_TOKENS
 
-    # Priority 1: context compression (token-budget-driven)
-    if est_tokens >= COMPRESS_TRIGGER_TOKENS:
-        return "compress"
+    def post_tool_router(state) -> Literal["agent", "compress", "inject_hint"]:
+        """Route after sync_state based on token budget and workflow state.
 
-    # Priority 2: pre-emptive workflow hint (fire only once)
-    if (cst_count >= HINT_CST_THRESHOLD
-            and not trained
-            and not _hint_already_injected(messages)):
-        return "inject_hint"
+        Priority order:
+          1. **compress** — token budget exceeded.
+          2. **inject_hint** — approaching CST limit without surrogate.
+          3. **agent** — default.
+        """
+        messages = state.get("messages", [])
+        est_tokens = _estimate_tokens(messages)
+        cst_count = state.get("cst_call_count", 0)
+        trained = state.get("surrogate_trained", False)
 
-    # Default
-    return "agent"
+        if est_tokens >= _trigger:
+            return "compress"
+
+        if (cst_count >= HINT_CST_THRESHOLD
+                and not trained
+                and not _hint_already_injected(messages)):
+            return "inject_hint"
+
+        return "agent"
+
+    return post_tool_router
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -314,7 +374,99 @@ def _estimate_tokens(messages) -> int:
     return total_chars // CHARS_PER_TOKEN_EST
 
 
-def _compute_adaptive_tail(messages) -> int:
+def _sanitize_tool_sequences(messages: list) -> list:
+    """Ensure every AIMessage.tool_calls has its ToolMessage responses.
+
+    Two-pass approach:
+      Pass 1 — identify complete (AIMessage + all ToolMessages) cycles.
+      Pass 2 — keep complete cycles intact; strip tool_calls from
+               orphaned AIMessages; drop orphaned ToolMessages.
+
+    This is the last line of defence before messages are sent to the
+    LLM API, which hard-rejects malformed sequences.
+    """
+    # Pass 1: tag messages that belong to complete cycles
+    in_complete_cycle: set[int] = set()  # indices
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
+            tc_ids = {tc["id"] for tc in msg.tool_calls}
+            n = len(tc_ids)
+            following = messages[i + 1 : i + 1 + n]
+            if (
+                len(following) == n
+                and all(isinstance(f, ToolMessage) for f in following)
+                and all(f.tool_call_id in tc_ids for f in following)
+            ):
+                for j in range(i, i + 1 + n):
+                    in_complete_cycle.add(j)
+                i += 1 + n
+                continue
+        i += 1
+
+    # Pass 2: build sanitised list
+    result = []
+    for i, msg in enumerate(messages):
+        if i in in_complete_cycle:
+            result.append(msg)
+        elif isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
+            # Orphaned AI with tool_calls → keep text, strip calls
+            result.append(AIMessage(
+                content=(msg.content or "") + "\n[Prior tool calls compressed]",
+                id=msg.id,
+            ))
+        elif isinstance(msg, ToolMessage):
+            # Orphaned ToolMessage → drop silently
+            pass
+        else:
+            result.append(msg)
+
+    return result
+
+
+def _align_to_safe_boundary(messages, proposed_split: int) -> int:
+    """Move the split point so the tail doesn't start mid-tool-call-cycle.
+
+    The DeepSeek (and OpenAI) API requires every ``AIMessage`` with
+    ``tool_calls`` to be immediately followed by the corresponding
+    ``ToolMessage`` responses.  If compression removes one half of a
+    cycle, the API rejects the request.
+
+    This function walks the split point **backward** (keeping more
+    messages in the tail) until the first tail message is safe:
+      - NOT a ``ToolMessage`` (which needs a preceding AIMessage)
+      - If it's an ``AIMessage`` with ``tool_calls``, all the
+        responding ``ToolMessage``\\ s must also be in the tail
+    """
+    idx = proposed_split
+
+    while idx > COMPRESS_KEEP_HEAD:
+        msg = messages[idx]
+
+        # Case 1: ToolMessage at boundary — its AIMessage was removed
+        if isinstance(msg, ToolMessage):
+            idx -= 1
+            continue
+
+        # Case 2: AIMessage with tool_calls — check responses are intact
+        if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
+            n_calls = len(msg.tool_calls)
+            following = messages[idx + 1 : idx + 1 + n_calls]
+            if len(following) == n_calls and all(
+                isinstance(m, ToolMessage) for m in following
+            ):
+                break  # complete cycle starts here — safe
+            idx -= 1
+            continue
+
+        # Case 3: HumanMessage / SystemMessage / plain AIMessage — safe
+        break
+
+    return idx
+
+
+def _compute_adaptive_tail(messages, target_tokens: int = COMPRESS_TARGET_TOKENS) -> int:
     """Compute how many tail messages to keep within the token budget.
 
     Walks backward from the most recent message, accumulating characters
@@ -323,7 +475,7 @@ def _compute_adaptive_tail(messages) -> int:
     """
     keep = 0
     chars = 0
-    target_chars = COMPRESS_TARGET_TOKENS * CHARS_PER_TOKEN_EST
+    target_chars = target_tokens * CHARS_PER_TOKEN_EST
 
     for m in reversed(messages[COMPRESS_KEEP_HEAD:]):
         msg_chars = len(getattr(m, "content", "") or "")
