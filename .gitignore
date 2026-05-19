@@ -19,8 +19,9 @@ data/
 # ── Agent run outputs ──
 data/agent_runs/
 
-# ── Claude Code session state ──
+# ── Claude Code ──
 .claude/
+CLAUDE.md
 
 # ── Environment / secrets ──
 .env
