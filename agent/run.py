@@ -27,7 +27,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from agent.config import AGENT_OUTPUT_DIR, MAX_CST_CALLS
+from agent.config import AGENT_OUTPUT_DIR, MAX_CST_CALLS, GRAPH_RECURSION_LIMIT
 from agent.tools import SharedState
 
 
@@ -176,23 +176,45 @@ def main():
     print(f"Output: {run_dir}")
     print(f"{'='*60}\n")
 
-    config = {"configurable": {"thread_id": f"run_{timestamp}"}}
+    config = {
+        "configurable": {"thread_id": f"run_{timestamp}"},
+        "recursion_limit": GRAPH_RECURSION_LIMIT,
+    }
+
     initial_message = (
         "Begin optimization. You have 0 data points and a budget of "
         f"{args.max_cst_calls} CST calls. Start by planning your initial "
         "exploration strategy, then execute it."
     )
 
+    # Initial state with all OptimizationState fields
+    initial_state = {
+        "messages": [("user", initial_message)],
+        "cst_call_count": 0,
+        "surrogate_trained": False,
+        "surrogate_r2_dphi": -1.0,
+        "best_fom": -999.0,
+    }
+
     t0 = time.time()
+    last_printed_id = None  # dedup across multi-node stream events
     try:
         for event in agent.stream(
-            {"messages": [("user", initial_message)]},
+            initial_state,
             config=config,
             stream_mode="values",
         ):
-            # Print the latest message
             if event.get("messages"):
                 last_msg = event["messages"][-1]
+                msg_id = getattr(last_msg, "id", None)
+
+                # Skip if we already printed this message (sync_state
+                # emits state without adding messages, so the last_msg
+                # is unchanged from the previous event)
+                if msg_id and msg_id == last_printed_id:
+                    continue
+                last_printed_id = msg_id
+
                 if hasattr(last_msg, "content") and last_msg.content:
                     role = getattr(last_msg, "type", "unknown")
                     # Sanitise for Windows console (cp932 etc.)

@@ -53,6 +53,7 @@ FOM_TRANS_WEIGHT = 1.0         # reward for transmittance
 # ── Agent defaults ────────────────────────────────────────────────
 MAX_CST_CALLS = 200
 MAX_ITERATIONS = 50
+GRAPH_RECURSION_LIMIT = 500    # nodes per run (each tool cycle ≈ 3-4 nodes)
 
 # ── Fresnel propagation ──────────────────────────────────────────
 FRESNEL_Z_POSITIONS_UM = [
