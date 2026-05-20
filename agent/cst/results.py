@@ -1,39 +1,61 @@
 """
-Extract S-parameter results from a solved CST project.
+Read S-parameter results using CST 2025's official Python API (cst.results).
 
-Result tree paths match the CSV column headers from result_navigator.csv:
-  - SZmax(1) → TE mode
-  - SZmax(2) → TM mode
+CST 2025 dropped the old file-based result API (.sig files), so COM access
+via ``Result0D`` / ``Result1DComplex`` no longer works. Instead we use the
+bundled ``cst.results.ProjectFile``, which reads results straight from the
+.cst project file and does NOT need CST running.
+
+Tree paths used (from the result tree exploration):
+  - 1D Results\\S-Parameters\\SZmax(1),Zmin(1)  → TE transmission (complex)
+  - 1D Results\\S-Parameters\\SZmax(2),Zmin(2)  → TM transmission (complex)
 """
 
 from __future__ import annotations
 
 import logging
+import math
 
 logger = logging.getLogger(__name__)
 
 
-def extract_s_parameters(project) -> dict:
-    """Extract TE/TM S-parameter magnitudes and phases.
+def extract_s_parameters(project_path: str, target_freq_thz: float) -> dict:
+    """Read TE/TM S-parameters at the target frequency via cst.results.
+
+    Parameters
+    ----------
+    project_path : str
+        Absolute path to the .cst project file.
+    target_freq_thz : float
+        Target frequency in THz (e.g. c/632nm ≈ 474.4 THz).
 
     Returns
     -------
     dict with keys: TE_mag_dB, TE_phase, TM_mag_dB, TM_phase
     """
-    tree = project.ResultTree()
+    # Import inside the function — sys.path is set by connection.py
+    from cst.results import ProjectFile
 
-    te_mag = float(tree.GetResultData(
-        "Tables\\0D Results\\SZmax(1),Zmin(1)_0D", "yAtX"
-    ))
-    te_phase = float(tree.GetResultData(
-        "Tables\\0D Results\\SZmax(1),Zmin(1)_0D", "yAtX_1"
-    ))
-    tm_mag = float(tree.GetResultData(
-        "Tables\\0D Results\\SZmax(2),Zmin(2)_0D", "yAtX"
-    ))
-    tm_phase = float(tree.GetResultData(
-        "Tables\\0D Results\\SZmax(2),Zmin(2)_0D", "yAtX_1"
-    ))
+    # cst.results prints "You are working in interactive mode." to stdout
+    # on construction — silence it.
+    import io
+    import contextlib
+    with contextlib.redirect_stdout(io.StringIO()):
+        pf = ProjectFile(project_path, allow_interactive=True)
+    threed = pf.get_3d()
+
+    def _read(path: str) -> tuple[float, float]:
+        item = threed.get_result_item(path)
+        xs = item.get_xdata()
+        ys = item.get_ydata()
+        best_i = min(range(len(xs)), key=lambda i: abs(xs[i] - target_freq_thz))
+        val = ys[best_i]
+        mag_db = 10 * math.log10(max(abs(val) ** 2, 1e-20))
+        phase_deg = math.degrees(math.atan2(val.imag, val.real))
+        return mag_db, phase_deg
+
+    te_mag, te_phase = _read("1D Results\\S-Parameters\\SZmax(1),Zmin(1)")
+    tm_mag, tm_phase = _read("1D Results\\S-Parameters\\SZmax(2),Zmin(2)")
 
     result = {
         "TE_mag_dB": te_mag,
@@ -46,10 +68,7 @@ def extract_s_parameters(project) -> dict:
 
 
 def convert_s_params(sparam: dict) -> dict:
-    """Convert raw S-parameters to physical quantities.
-
-    Applies the same formulas as surrogate_optimization.py lines 126-131.
-    """
+    """Convert raw S-parameters to physical quantities (transmittance, phase diff)."""
     T_TE = 10 ** (sparam["TE_mag_dB"] / 10.0) * 100.0
     T_TM = 10 ** (sparam["TM_mag_dB"] / 10.0) * 100.0
 

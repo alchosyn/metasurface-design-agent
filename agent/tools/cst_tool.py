@@ -131,18 +131,49 @@ def make_cst_tool(shared: SharedState):
 
 
 def _real_simulate(L: float, W: float, h: float, shared: SharedState) -> dict:
-    """Run actual CST simulation via COM."""
+    """Run actual CST simulation via cst.interface API.
+
+    Re-attaches to the DesignEnvironment from THIS thread to avoid any
+    cross-thread state issues (LangGraph ToolNode runs us in a worker
+    thread but the connection was opened in the main thread).
+
+    No quiet_mode context — that call can hang indefinitely if CST has
+    a modal popup open. Caller must ensure CST is in a clean state.
+    """
+    from agent.config import WAVELENGTH_NM
     from agent.cst.geometry import set_pillar_geometry
     from agent.cst.solver import run_frequency_solver
     from agent.cst.results import extract_s_parameters, convert_s_params
 
     if shared.cst_connection is None:
-        raise RuntimeError("CST connection not initialised. Set cst_project_path.")
+        raise RuntimeError("CST connection not initialised.")
 
-    project = shared.cst_connection.project
-    set_pillar_geometry(project, L, W, h)
-    run_frequency_solver(project)
-    sparam = extract_s_parameters(project)
+    logger.info(f"_real_simulate start: L={L}, W={W}, h={h}")
+
+    # Re-attach to the running CST DesignEnvironment from the current
+    # thread. This is cheap (connects to existing process) and avoids
+    # any cross-thread issues with the cached `shared.cst_connection.de`.
+    from cst.interface import DesignEnvironment
+    logger.info("  connecting to CST...")
+    de = DesignEnvironment.connect_to_any()
+    logger.info("  getting active project...")
+    project = de.active_project()
+    model3d = project.model3d
+    logger.info("  got model3d")
+
+    set_pillar_geometry(model3d, L, W, h)
+
+    logger.info("  starting solver...")
+    run_frequency_solver(model3d)
+
+    logger.info("  saving project...")
+    project.save()
+    logger.info("  reading results...")
+
+    # Read results out-of-process — cst.results reads the .cst file
+    target_freq_thz = 299792.458 / WAVELENGTH_NM
+    sparam = extract_s_parameters(shared.cst_project_path, target_freq_thz)
+    logger.info("  done")
     return convert_s_params(sparam)
 
 

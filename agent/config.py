@@ -6,9 +6,11 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from dotenv import load_dotenv
 
 # ── Project paths ──────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(PROJECT_ROOT / ".env")
 ML_DIR = PROJECT_ROOT / "ml"
 DATA_DIR = PROJECT_ROOT / "data"
 MATLAB_DIR = PROJECT_ROOT / "matlab" / "Double Helix"
