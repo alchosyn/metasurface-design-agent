@@ -9,6 +9,7 @@ to avoid serialising large objects (model weights, numpy arrays).
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -20,6 +21,12 @@ from agent.config import MAX_CST_CALLS
 @dataclass
 class SharedState:
     """Mutable shared state accessible by all tools via closure."""
+
+    # ── Serialise CST access (only one simulation at a time) ──
+    # LangGraph ToolNode runs parallel tool calls in a thread pool —
+    # without this lock concurrent run_cst calls clobber each other's
+    # parameters in the single shared CST project.
+    cst_lock: Any = field(default_factory=threading.Lock)
 
     # ── CST experiment database ──
     cst_database: list[dict] = field(default_factory=list)

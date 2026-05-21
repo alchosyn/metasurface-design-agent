@@ -148,33 +148,39 @@ def _real_simulate(L: float, W: float, h: float, shared: SharedState) -> dict:
     if shared.cst_connection is None:
         raise RuntimeError("CST connection not initialised.")
 
-    logger.info(f"_real_simulate start: L={L}, W={W}, h={h}")
+    logger.info(f"_real_simulate queued: L={L}, W={W}, h={h}")
 
-    # Re-attach to the running CST DesignEnvironment from the current
-    # thread. This is cheap (connects to existing process) and avoids
-    # any cross-thread issues with the cached `shared.cst_connection.de`.
-    from cst.interface import DesignEnvironment
-    logger.info("  connecting to CST...")
-    de = DesignEnvironment.connect_to_any()
-    logger.info("  getting active project...")
-    project = de.active_project()
-    model3d = project.model3d
-    logger.info("  got model3d")
+    # Serialise all CST access — LangGraph may run multiple run_cst
+    # tool calls concurrently in worker threads, but the single CST
+    # project can only handle one parameter+solve cycle at a time.
+    with shared.cst_lock:
+        logger.info(f"_real_simulate start: L={L}, W={W}, h={h}")
 
-    set_pillar_geometry(model3d, L, W, h)
+        # Re-attach to the running CST DesignEnvironment from the current
+        # thread. This is cheap (connects to existing process) and avoids
+        # cross-thread issues with cached `shared.cst_connection.de`.
+        from cst.interface import DesignEnvironment
+        logger.info("  connecting to CST...")
+        de = DesignEnvironment.connect_to_any()
+        logger.info("  getting active project...")
+        project = de.active_project()
+        model3d = project.model3d
+        logger.info("  got model3d")
 
-    logger.info("  starting solver...")
-    run_frequency_solver(model3d)
+        set_pillar_geometry(model3d, L, W, h)
 
-    logger.info("  saving project...")
-    project.save()
-    logger.info("  reading results...")
+        logger.info("  starting solver...")
+        run_frequency_solver(model3d)
 
-    # Read results out-of-process — cst.results reads the .cst file
-    target_freq_thz = 299792.458 / WAVELENGTH_NM
-    sparam = extract_s_parameters(shared.cst_project_path, target_freq_thz)
-    logger.info("  done")
-    return convert_s_params(sparam)
+        logger.info("  saving project...")
+        project.save()
+        logger.info("  reading results...")
+
+        # Read results out-of-process — cst.results reads the .cst file
+        target_freq_thz = 299792.458 / WAVELENGTH_NM
+        sparam = extract_s_parameters(shared.cst_project_path, target_freq_thz)
+        logger.info("  done")
+        return convert_s_params(sparam)
 
 
 def _mock_simulate(L: float, W: float, h: float, shared: SharedState) -> dict:
